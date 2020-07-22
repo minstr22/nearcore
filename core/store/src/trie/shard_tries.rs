@@ -1,4 +1,4 @@
-use crate::db::{DBCol, DBOp, DBTransaction};
+use crate::db::{DBCol, DBOp, DBTransaction, ReadSnapshot};
 use crate::trie::encode_trie_node_with_rc;
 use crate::trie::trie_storage::{TrieCache, TrieCachingStorage};
 use crate::{StorageError, Store, StoreUpdate, Trie, TrieChanges, TrieUpdate};
@@ -14,13 +14,14 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ShardTries {
-    pub(crate) store: Arc<Store>,
+    pub(crate) store: Arc<dyn ReadSnapshot>,
     pub(crate) caches: Arc<Vec<TrieCache>>,
 }
 
 impl ShardTries {
     pub fn new(store: Arc<Store>, num_shards: NumShards) -> Self {
         assert_ne!(num_shards, 0);
+        let store = store.storage.clone().get_snapshot();
         let caches = Arc::new((0..num_shards).map(|_| TrieCache::new()).collect::<Vec<_>>());
         ShardTries { store, caches }
     }
@@ -38,8 +39,8 @@ impl ShardTries {
         Trie::new(store, shard_id)
     }
 
-    pub fn get_store(&self) -> Arc<Store> {
-        self.store.clone()
+    pub fn get_store(&self) -> Store {
+        Store::new(self.store.get_store().clone())
     }
 
     pub fn update_cache(&self, transaction: &DBTransaction) -> std::io::Result<()> {

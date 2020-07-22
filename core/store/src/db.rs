@@ -13,7 +13,6 @@ use strum_macros::EnumIter;
 
 use near_primitives::version::DbVersion;
 use std::marker::PhantomPinned;
-use std::ops::Deref;
 use std::pin::Pin;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -254,6 +253,8 @@ pub trait ReadSnapshot: Sync + Send {
         col: DBCol,
         key_prefix: &'a [u8],
     ) -> Box<dyn Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a>;
+
+    fn get_store(&self) -> Pin<Arc<dyn Database>>;
 }
 
 pub struct RocksDBOwningSnapshot {
@@ -293,6 +294,10 @@ impl ReadSnapshot for RocksDBOwningSnapshot {
             .take_while(move |(key, _value)| key.starts_with(key_prefix));
         Box::new(iterator)
     }
+
+    fn get_store(&self) -> Pin<Arc<dyn Database>> {
+        self.db.clone()
+    }
 }
 
 pub trait Database: Sync + Send {
@@ -310,7 +315,7 @@ pub trait Database: Sync + Send {
         key_prefix: &'a [u8],
     ) -> Box<dyn Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a>;
     fn write(&self, batch: DBTransaction) -> Result<(), DBError>;
-    fn get_snapshot(self: Pin<Arc<Self>>) -> Box<dyn ReadSnapshot>;
+    fn get_snapshot(self: Pin<Arc<Self>>) -> Arc<dyn ReadSnapshot>;
 }
 
 impl Database for RocksDB {
@@ -371,16 +376,13 @@ impl Database for RocksDB {
         Ok(self.db.write(batch)?)
     }
 
-    fn get_snapshot(self: Pin<Arc<Self>>) -> Box<dyn ReadSnapshot> {
+    fn get_snapshot(self: Pin<Arc<Self>>) -> Arc<dyn ReadSnapshot> {
         let snapshot = unsafe { std::mem::transmute(self.db.snapshot()) };
-        Box::new(RocksDBOwningSnapshot { db: self, snapshot })
+        Arc::new(RocksDBOwningSnapshot { db: self, snapshot })
     }
 }
 
-impl<TestDBRef> ReadSnapshot for TestDBRef
-where
-    TestDBRef: Deref<Target = TestDB> + Send + Sync,
-{
+impl ReadSnapshot for Pin<Arc<TestDB>> {
     fn get(&self, col: DBCol, key: &[u8]) -> Result<Option<Vec<u8>>, DBError> {
         (*self).get_unsafe(col, key)
     }
@@ -395,6 +397,10 @@ where
         key_prefix: &'b [u8],
     ) -> Box<dyn Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'b> {
         (*self).iter_prefix_unsafe(col, key_prefix)
+    }
+
+    fn get_store(&self) -> Pin<Arc<dyn Database>> {
+        self.clone()
     }
 }
 
@@ -433,8 +439,8 @@ impl Database for TestDB {
         Ok(())
     }
 
-    fn get_snapshot(self: Pin<Arc<Self>>) -> Box<dyn ReadSnapshot> {
-        Box::new(self)
+    fn get_snapshot(self: Pin<Arc<Self>>) -> Arc<dyn ReadSnapshot> {
+        Arc::new(self)
     }
 }
 

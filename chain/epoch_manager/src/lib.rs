@@ -38,6 +38,10 @@ const AGGREGATOR_SAVE_PERIOD: u64 = 1000;
 /// Tracks epoch information across different forks, such as validators.
 /// Note: that even after garbage collection, the data about genesis epoch should be in the store.
 pub struct EpochManager {
+    /// Notes:
+    /// 1. Store records are immutable with the exception of EpochInfoAggregator
+    /// 2. Cache can have entries that were GC-ed from store.
+    /// 3. Store does not use snapshots, so data can disappear between reads.
     store: Arc<Store>,
     /// Current epoch config.
     /// TODO: must be dynamically changing over time, so there should be a way to change it.
