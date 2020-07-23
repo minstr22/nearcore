@@ -1017,7 +1017,7 @@ mod tests {
                         .as_caching_storage()
                         .unwrap()
                         .store
-                        .iter(ColState)
+                        .iter_unsafe(ColState)
                         .peekable()
                         .peek()
                         .is_none(),
