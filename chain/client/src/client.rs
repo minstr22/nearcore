@@ -670,15 +670,33 @@ impl Client {
         &mut self,
         forward: PartialEncodedChunkForwardMsg,
     ) -> Result<Vec<AcceptedBlock>, Error> {
-        self.shards_mgr.validate_partial_encoded_chunk_forward(&forward)?;
+        let maybe_header = self
+            .shards_mgr
+            .validate_partial_encoded_chunk_forward(&forward)
+            .and_then(|_| self.shards_mgr.get_partial_encoded_chunk_header(&forward.chunk_hash));
 
-        let header = match self.shards_mgr.get_partial_encoded_chunk_header(&forward.chunk_hash) {
+        let header = match maybe_header {
             Ok(header) => Ok(header),
             Err(near_chunks::Error::UnknownChunk) => {
                 // We don't know this chunk yet; cache the forwarded part
                 // to be used after we get the header.
                 self.shards_mgr.insert_forwarded_chunk(forward);
                 return Err(Error::Chunk(near_chunks::Error::UnknownChunk));
+            }
+            Err(near_chunks::Error::ChainError(chain_error)) => {
+                match chain_error.kind() {
+                    near_chain::ErrorKind::BlockMissing(_)
+                    | near_chain::ErrorKind::DBNotFoundErr(_) => {
+                        // We can't check if this chunk came from a valid chunk producer because
+                        // we don't know `prev_block`, however the signature is checked when
+                        // forwarded parts are later processed as partial encoded chunks, so we
+                        // can mark it as unknown for now.
+                        self.shards_mgr.insert_forwarded_chunk(forward);
+                        return Err(Error::Chunk(near_chunks::Error::UnknownChunk));
+                    }
+                    // Some other error occurred, we don't know how to handle it
+                    _ => Err(near_chunks::Error::ChainError(chain_error)),
+                }
             }
             Err(err) => Err(err),
         }?;
@@ -1424,6 +1442,7 @@ mod test {
     use near_chunks::test_utils::ChunkForwardingTestFixture;
     use near_chunks::ProcessPartialEncodedChunkResult;
     use near_crypto::KeyType;
+    use near_network::types::PartialEncodedChunkForwardMsg;
     use near_primitives::block::{Approval, ApprovalInner};
     use near_primitives::hash::hash;
     use near_primitives::validator_signer::InMemoryValidatorSigner;
@@ -1468,6 +1487,10 @@ mod test {
         // change the prev_block to some unknown block
         mock_chunk.header.inner.prev_block_hash = hash(b"some_prev_block");
         mock_chunk.header.init();
+        let mock_forward = PartialEncodedChunkForwardMsg::from_header_and_parts(
+            &mock_chunk.header,
+            mock_chunk.parts.clone(),
+        );
 
         // process_partial_encoded_chunk should return Ok(NeedBlock) if the chunk is
         // based on a missing block.
@@ -1477,5 +1500,13 @@ mod test {
             &mut client.rs,
         );
         assert!(matches!(result, Ok(ProcessPartialEncodedChunkResult::NeedBlock)));
+
+        // process_partial_encoded_chunk_forward should return UnknownChunk if it is based on a
+        // a missing block.
+        let result = client.process_partial_encoded_chunk_forward(mock_forward);
+        assert!(matches!(
+            result,
+            Err(crate::types::Error::Chunk(near_chunks::Error::UnknownChunk))
+        ));
     }
 }
