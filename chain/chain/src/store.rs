@@ -3053,7 +3053,7 @@ mod tests {
         }
 
         chain.epoch_length = 1;
-        let trie = chain.runtime_adapter.get_tries();
+        let trie = chain.runtime_adapter.get_state_adapter().get_tries();
         assert!(chain.clear_data(trie, 100).is_ok());
 
         assert!(chain.get_block(&blocks[0].hash()).is_ok());
@@ -3162,7 +3162,7 @@ mod tests {
         );
         assert!(chain.mut_store().get_next_block_hash(&blocks[5].hash()).is_ok());
 
-        let trie = chain.runtime_adapter.get_tries();
+        let trie = chain.runtime_adapter.get_state_adapter().get_tries();
         let mut store_update = chain.mut_store().store_update();
         assert!(store_update.clear_block_data(*blocks[5].hash(), GCMode::Canonical(trie)).is_ok());
         store_update.commit().unwrap();
@@ -3238,7 +3238,7 @@ mod tests {
             prev_block = block.clone();
         }
 
-        let trie = chain.runtime_adapter.get_tries();
+        let trie = chain.runtime_adapter.get_state_adapter().get_tries();
 
         for iter in 0..10 {
             println!("ITERATION #{:?}", iter);

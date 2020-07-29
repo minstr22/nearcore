@@ -297,6 +297,7 @@ fn validate_chunk_state_challenge(
     // Apply state transition and check that the result state and other data doesn't match.
     let partial_storage = PartialStorage { nodes: chunk_state.partial_state.clone() };
     let result = runtime_adapter
+        .get_state_adapter()
         .check_state_transition(
             partial_storage,
             chunk_state.prev_chunk.header.inner.shard_id,

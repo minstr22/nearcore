@@ -119,7 +119,7 @@ mod tests {
 
         // Init Chain 1
         let mut chain1 = get_chain(num_shards);
-        let tries1 = chain1.runtime_adapter.get_tries();
+        let tries1 = chain1.runtime_adapter.get_state_adapter().get_tries();
         let mut rng = rand::thread_rng();
         let shard_to_check_trie = rng.gen_range(0, num_shards);
         let trie1 = tries1.get_trie_for_shard(shard_to_check_trie);
@@ -153,7 +153,7 @@ mod tests {
         }
 
         let mut chain2 = get_chain(num_shards);
-        let tries2 = chain2.runtime_adapter.get_tries();
+        let tries2 = chain2.runtime_adapter.get_state_adapter().get_tries();
         let trie2 = tries2.get_trie_for_shard(shard_to_check_trie);
 
         // Find gc_height

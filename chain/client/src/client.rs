@@ -543,6 +543,7 @@ impl Client {
         let transactions = if let Some(mut iter) = shards_mgr.get_pool_iterator(shard_id) {
             let transaction_validity_period = chain.transaction_validity_period;
             runtime_adapter
+                .get_state_adapter()
                 .prepare_transactions(
                     prev_block_header.gas_price(),
                     chunk_extra.gas_limit,
@@ -800,10 +801,10 @@ impl Client {
             self.shards_mgr.update_largest_seen_height(block.header().height());
             if !self.config.archive {
                 let timer = near_metrics::start_timer(&metrics::GC_TIME);
-                if let Err(err) = self
-                    .chain
-                    .clear_data(self.runtime_adapter.get_tries(), self.config.gc_blocks_limit)
-                {
+                if let Err(err) = self.chain.clear_data(
+                    self.runtime_adapter.get_state_adapter().get_tries(),
+                    self.config.gc_blocks_limit,
+                ) {
                     error!(target: "client", "Can't clear old data, {:?}", err);
                     debug_assert!(false);
                 };
