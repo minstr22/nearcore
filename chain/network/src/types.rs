@@ -214,7 +214,7 @@ impl From<HandshakeV1> for Handshake {
     fn from(handshake_old: HandshakeV1) -> Self {
         Self {
             version: handshake_old.version,
-            oldest_supported_version: handshake_old.version - 1,
+            oldest_supported_version: handshake_old.version,
             peer_id: handshake_old.peer_id,
             target_peer_id: handshake_old.target_peer_id,
             listen_port: handshake_old.listen_port,
