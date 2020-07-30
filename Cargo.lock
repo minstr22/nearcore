@@ -2735,7 +2735,6 @@ dependencies = [
  "num-rational",
  "serde",
  "serde_json",
- "strum",
 ]
 
 [[package]]
