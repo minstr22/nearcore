@@ -204,7 +204,7 @@ fn sample_binary(n: u64, k: u64) -> bool {
 }
 
 pub struct BlockStats {
-    hash2height: HashMap<CryptoHash, u64>,
+    hash2depth: HashMap<CryptoHash, u64>,
     num_blocks: u64,
     max_chain_length: u64,
     last_check: Instant,
@@ -216,7 +216,7 @@ pub struct BlockStats {
 impl BlockStats {
     fn new() -> BlockStats {
         BlockStats {
-            hash2height: HashMap::new(),
+            hash2depth: HashMap::new(),
             num_blocks: 0,
             max_chain_length: 0,
             last_check: Instant::now(),
@@ -227,8 +227,8 @@ impl BlockStats {
     }
 
     fn calculate_distance(&mut self, mut lhs: CryptoHash, mut rhs: CryptoHash) -> u64 {
-        let mut dlhs = *self.hash2height.get(&lhs).unwrap();
-        let mut drhs = *self.hash2height.get(&rhs).unwrap();
+        let mut dlhs = *self.hash2depth.get(&lhs).unwrap();
+        let mut drhs = *self.hash2depth.get(&rhs).unwrap();
 
         let mut result: u64 = 0;
         while dlhs > drhs {
@@ -250,13 +250,13 @@ impl BlockStats {
     }
 
     fn add_block(&mut self, block: &Block) {
-        if self.hash2height.contains_key(block.hash()) {
+        if self.hash2depth.contains_key(block.hash()) {
             return;
         }
-        let prev_height = self.hash2height.get(block.header().prev_hash()).map(|v| *v).unwrap_or(0);
-        self.hash2height.insert(*block.hash(), prev_height + 1);
+        let prev_depth = self.hash2depth.get(block.header().prev_hash()).map(|v| *v).unwrap_or(0);
+        self.hash2depth.insert(*block.hash(), prev_depth + 1);
         self.num_blocks += 1;
-        self.max_chain_length = max(self.max_chain_length, prev_height + 1);
+        self.max_chain_length = max(self.max_chain_length, prev_depth + 1);
         self.parent.insert(*block.hash(), *block.header().prev_hash());
 
         if let Some(last_hash2) = self.last_hash {
@@ -283,19 +283,19 @@ impl BlockStats {
 
     pub fn check_block_ratio(&mut self, min_ratio: Option<f64>, max_ratio: Option<f64>) {
         let cur_ratio = (self.num_blocks as f64) / (max(1, self.max_chain_length) as f64);
-        if let Some(min_ratio2) = min_ratio {
-            if cur_ratio < min_ratio2 {
+        if let Some(min_ratio) = min_ratio {
+            if cur_ratio < min_ratio {
                 panic!(
                     "ratio of blocks to longest chain is too low got: {:.2} expected: {:.2}",
-                    cur_ratio, min_ratio2
+                    cur_ratio, min_ratio
                 );
             }
         }
-        if let Some(max_ratio2) = max_ratio {
-            if cur_ratio > max_ratio2 {
+        if let Some(max_ratio) = max_ratio {
+            if cur_ratio > max_ratio {
                 panic!(
                     "ratio of blocks to longest chain is too high got: {:.2} expected: {:.2}",
-                    cur_ratio, max_ratio2
+                    cur_ratio, max_ratio
                 );
             }
         }
