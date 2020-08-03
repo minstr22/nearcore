@@ -16,7 +16,9 @@ use near_primitives::types::{ShardId, StateRoot, StateRootNode};
 use crate::trie::insert_delete::NodesStorage;
 use crate::trie::iterator::TrieIterator;
 use crate::trie::nibble_slice::NibbleSlice;
-pub use crate::trie::shard_tries::{KeyForStateChanges, ShardTries, WrappedTrieChanges};
+pub use crate::trie::shard_tries::{
+    KeyForStateChanges, ShardTries, TrieCaches, WrappedTrieChanges,
+};
 use crate::trie::trie_storage::{
     TouchedNodesCounter, TrieCachingStorage, TrieMemoryPartialStorage, TrieRecordingStorage,
     TrieStorage,
@@ -1029,8 +1031,8 @@ mod tests {
 
     #[test]
     fn test_trie_restart() {
-        let store = create_test_store();
-        let tries = ShardTries::new(store.clone(), 1);
+        let tries = create_tries();
+        let store = tries.get_store();
         let empty_root = Trie::empty_root();
         let changes = vec![
             (b"doge".to_vec(), Some(b"coin".to_vec())),
@@ -1042,7 +1044,7 @@ mod tests {
         ];
         let root = test_populate_trie(&tries, &empty_root, 0, changes.clone());
 
-        let tries2 = ShardTries::new(store, 1);
+        let tries2 = ShardTries::new(Arc::new(store), TrieCaches::new(1));
         let trie2 = tries2.get_trie_for_shard(0);
         assert_eq!(trie2.get(&root, b"doge"), Ok(Some(b"coin".to_vec())));
     }
@@ -1050,8 +1052,7 @@ mod tests {
     // TODO: somehow also test that we don't record unnecessary nodes
     #[test]
     fn test_trie_recording_reads() {
-        let store = create_test_store();
-        let tries = ShardTries::new(store.clone(), 1);
+        let tries = create_tries();
         let empty_root = Trie::empty_root();
         let changes = vec![
             (b"doge".to_vec(), Some(b"coin".to_vec())),
@@ -1077,8 +1078,7 @@ mod tests {
 
     #[test]
     fn test_trie_recording_reads_update() {
-        let store = create_test_store();
-        let tries = ShardTries::new(store.clone(), 1);
+        let tries = create_tries();
         let empty_root = Trie::empty_root();
         let changes = vec![
             (b"doge".to_vec(), Some(b"coin".to_vec())),
@@ -1112,8 +1112,8 @@ mod tests {
 
     #[test]
     fn test_dump_load_trie() {
-        let store = create_test_store();
-        let tries = ShardTries::new(store.clone(), 1);
+        let tries = create_tries();
+        let store = tries.get_store();
         let empty_root = Trie::empty_root();
         let changes = vec![
             (b"doge".to_vec(), Some(b"coin".to_vec())),
@@ -1124,7 +1124,7 @@ mod tests {
         store.save_to_file(ColState, &dir.path().join("test.bin")).unwrap();
         let store2 = create_test_store();
         store2.load_from_file(ColState, &dir.path().join("test.bin")).unwrap();
-        let tries2 = ShardTries::new(store2.clone(), 1);
+        let tries2 = ShardTries::new(store2.clone(), TrieCaches::new(1));
         let trie2 = tries2.get_trie_for_shard(0);
         assert_eq!(trie2.get(&root, b"doge").unwrap().unwrap(), b"coin");
     }

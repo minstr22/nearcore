@@ -34,7 +34,8 @@ use near_primitives::views::{
 };
 use near_store::test_utils::create_test_store;
 use near_store::{
-    ColBlockHeader, PartialStorage, ShardTries, Store, Trie, TrieChanges, WrappedTrieChanges,
+    ColBlockHeader, PartialStorage, ShardTries, Store, Trie, TrieCaches, TrieChanges,
+    WrappedTrieChanges,
 };
 
 use crate::chain::{Chain, NUM_EPOCHS_TO_KEEP_STORE_DATA};
@@ -104,7 +105,7 @@ impl KeyValueRuntime {
         num_shards: NumShards,
         epoch_length: u64,
     ) -> Self {
-        let tries = ShardTries::new(store.clone(), num_shards);
+        let tries = ShardTries::new(store.clone(), TrieCaches::new(num_shards));
         let mut initial_amounts = HashMap::new();
         for (i, validator) in validators.iter().flatten().enumerate() {
             initial_amounts.insert(validator.clone(), (1000 + 100 * i) as u128);
@@ -257,199 +258,13 @@ impl KeyValueRuntime {
     }
 }
 
-impl RuntimeStateAdapter for KeyValueRuntime {
+impl RuntimeStateAdapter for &KeyValueRuntime {
     fn get_tries(&self) -> ShardTries {
         self.tries.clone()
     }
 
     fn get_trie_for_shard(&self, shard_id: ShardId) -> Trie {
         self.tries.get_trie_for_shard(shard_id)
-    }
-
-    fn verify_block_vrf(
-        &self,
-        _epoch_id: &EpochId,
-        _block_height: BlockHeight,
-        _prev_random_value: &CryptoHash,
-        _vrf_value: &near_crypto::vrf::Value,
-        _vrf_proof: &near_crypto::vrf::Proof,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn verify_validator_signature(
-        &self,
-        _epoch_id: &EpochId,
-        _last_known_block_hash: &CryptoHash,
-        _account_id: &AccountId,
-        _data: &[u8],
-        _signature: &Signature,
-    ) -> Result<bool, Error> {
-        Ok(true)
-    }
-
-    fn verify_header_signature(&self, header: &BlockHeader) -> Result<bool, Error> {
-        let validators = &self.validators
-            [self.get_epoch_and_valset(*header.prev_hash()).map_err(|err| err.to_string())?.1];
-        let validator = &validators[(header.height() as usize) % validators.len()];
-        Ok(header.verify_block_producer(&validator.public_key))
-    }
-
-    fn verify_chunk_header_signature(&self, _header: &ShardChunkHeader) -> Result<bool, Error> {
-        Ok(true)
-    }
-
-    fn verify_approval(
-        &self,
-        _prev_block_hash: &CryptoHash,
-        _prev_block_height: BlockHeight,
-        _block_height: BlockHeight,
-        _approvals: &[Option<Signature>],
-    ) -> Result<bool, Error> {
-        Ok(true)
-    }
-
-    fn get_epoch_block_producers_ordered(
-        &self,
-        epoch_id: &EpochId,
-        _last_known_block_hash: &CryptoHash,
-    ) -> Result<Vec<(ValidatorStake, bool)>, Error> {
-        let validators = &self.validators[self.get_valset_for_epoch(epoch_id)?];
-        Ok(validators.iter().map(|x| (x.clone(), false)).collect())
-    }
-
-    fn get_epoch_block_approvers_ordered(
-        &self,
-        parent_hash: &CryptoHash,
-    ) -> Result<Vec<ApprovalStake>, Error> {
-        let (_cur_epoch, cur_valset, next_epoch) =
-            self.get_epoch_and_valset(parent_hash.clone())?;
-        let mut validators = self.validators[cur_valset]
-            .iter()
-            .map(|x| x.get_approval_stake(false))
-            .collect::<Vec<_>>();
-        if *self.hash_to_next_epoch_approvals_req.write().unwrap().get(parent_hash).unwrap() {
-            let validators_copy = validators.clone();
-            validators.extend(
-                self.validators[self.get_valset_for_epoch(&next_epoch)?]
-                    .iter()
-                    .filter(|x| {
-                        !validators_copy.iter().any(|entry| entry.account_id == x.account_id)
-                    })
-                    .map(|x| x.get_approval_stake(true)),
-            );
-        }
-        Ok(validators)
-    }
-
-    fn get_block_producer(
-        &self,
-        epoch_id: &EpochId,
-        height: BlockHeight,
-    ) -> Result<AccountId, Error> {
-        let validators = &self.validators[self.get_valset_for_epoch(epoch_id)?];
-        Ok(validators[(height as usize) % validators.len()].account_id.clone())
-    }
-
-    fn get_chunk_producer(
-        &self,
-        epoch_id: &EpochId,
-        height: BlockHeight,
-        shard_id: ShardId,
-    ) -> Result<AccountId, Error> {
-        let validators = &self.validators[self.get_valset_for_epoch(epoch_id)?];
-        assert_eq!((validators.len() as u64) % self.num_shards(), 0);
-        assert_eq!(0, validators.len() as u64 % self.validator_groups);
-        let validators_per_shard = validators.len() as ShardId / self.validator_groups;
-        let coef = validators.len() as ShardId / self.num_shards();
-        let offset = (shard_id * coef / validators_per_shard * validators_per_shard) as usize;
-        let delta = ((shard_id + height + 1) % validators_per_shard) as usize;
-        Ok(validators[offset + delta].account_id.clone())
-    }
-
-    fn num_shards(&self) -> ShardId {
-        self.num_shards
-    }
-
-    fn num_total_parts(&self) -> usize {
-        12 + (self.num_shards as usize + 1) % 50
-    }
-
-    fn num_data_parts(&self) -> usize {
-        // Same as in Nightshade Runtime
-        let total_parts = self.num_total_parts();
-        if total_parts <= 3 {
-            1
-        } else {
-            (total_parts - 1) / 3
-        }
-    }
-
-    fn account_id_to_shard_id(&self, account_id: &AccountId) -> ShardId {
-        account_id_to_shard_id(account_id, self.num_shards())
-    }
-
-    fn get_part_owner(&self, parent_hash: &CryptoHash, part_id: u64) -> Result<String, Error> {
-        let validators = &self.validators[self.get_epoch_and_valset(*parent_hash)?.1];
-        // if we don't use data_parts and total_parts as part of the formula here, the part owner
-        //     would not depend on height, and tests wouldn't catch passing wrong height here
-        let idx = part_id as usize + self.num_data_parts() + self.num_total_parts();
-        Ok(validators[idx as usize % validators.len()].account_id.clone())
-    }
-
-    fn cares_about_shard(
-        &self,
-        account_id: Option<&AccountId>,
-        parent_hash: &CryptoHash,
-        shard_id: ShardId,
-        _is_me: bool,
-    ) -> bool {
-        // This `unwrap` here tests that in all code paths we check that the epoch exists before
-        //    we check if we care about a shard. Please do not remove the unwrap, fix the logic of
-        //    the calling function.
-        let epoch_valset = self.get_epoch_and_valset(*parent_hash).unwrap();
-        let validators = &self.validators[epoch_valset.1];
-        assert_eq!((validators.len() as u64) % self.num_shards(), 0);
-        assert_eq!(0, validators.len() as u64 % self.validator_groups);
-        let validators_per_shard = validators.len() as ShardId / self.validator_groups;
-        let coef = validators.len() as ShardId / self.num_shards();
-        let offset = (shard_id * coef / validators_per_shard * validators_per_shard) as usize;
-        assert!(offset + validators_per_shard as usize <= validators.len());
-        if let Some(account_id) = account_id {
-            for validator in validators[offset..offset + (validators_per_shard as usize)].iter() {
-                if validator.account_id == *account_id {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn will_care_about_shard(
-        &self,
-        account_id: Option<&AccountId>,
-        parent_hash: &CryptoHash,
-        shard_id: ShardId,
-        _is_me: bool,
-    ) -> bool {
-        // This `unwrap` here tests that in all code paths we check that the epoch exists before
-        //    we check if we care about a shard. Please do not remove the unwrap, fix the logic of
-        //    the calling function.
-        let epoch_valset = self.get_epoch_and_valset(*parent_hash).unwrap();
-        let validators = &self.validators[(epoch_valset.1 + 1) % self.validators.len()];
-        assert_eq!((validators.len() as u64) % self.num_shards(), 0);
-        assert_eq!(0, validators.len() as u64 % self.validator_groups);
-        let validators_per_shard = validators.len() as ShardId / self.validator_groups;
-        let coef = validators.len() as ShardId / self.num_shards();
-        let offset = (shard_id * coef / validators_per_shard * validators_per_shard) as usize;
-        if let Some(account_id) = account_id {
-            for validator in validators[offset..offset + (validators_per_shard as usize)].iter() {
-                if validator.account_id == *account_id {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     fn validate_tx(
@@ -773,8 +588,8 @@ impl RuntimeStateAdapter for KeyValueRuntime {
 }
 
 impl RuntimeAdapter for KeyValueRuntime {
-    fn get_state_adapter(&self) -> &dyn RuntimeStateAdapter {
-        self
+    fn get_state_adapter<'a>(&'a self) -> Box<dyn RuntimeStateAdapter + 'a> {
+        Box::new(self)
     }
 
     fn genesis_state(&self) -> (Arc<Store>, Vec<StateRoot>) {
@@ -813,8 +628,11 @@ impl RuntimeAdapter for KeyValueRuntime {
         Ok(true)
     }
 
-    fn verify_header_signature(&self, _header: &BlockHeader) -> Result<bool, Error> {
-        Ok(true)
+    fn verify_header_signature(&self, header: &BlockHeader) -> Result<bool, Error> {
+        let validators = &self.validators
+            [self.get_epoch_and_valset(*header.prev_hash()).map_err(|err| err.to_string())?.1];
+        let validator = &validators[(header.height() as usize) % validators.len()];
+        Ok(header.verify_block_producer(&validator.public_key))
     }
 
     fn verify_chunk_header_signature(&self, _header: &ShardChunkHeader) -> Result<bool, Error> {

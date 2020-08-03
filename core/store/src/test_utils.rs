@@ -5,7 +5,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::db::TestDB;
-use crate::{ShardTries, Store};
+use crate::{ShardTries, Store, TrieCaches};
 use near_primitives::hash::CryptoHash;
 use near_primitives::types::ShardId;
 
@@ -18,7 +18,7 @@ pub fn create_test_store() -> Arc<Store> {
 /// Creates a Trie using an in-memory database.
 pub fn create_tries() -> ShardTries {
     let store = create_test_store();
-    ShardTries::new(store, 1)
+    ShardTries::new(store, TrieCaches::new(1))
 }
 
 pub fn test_populate_trie(

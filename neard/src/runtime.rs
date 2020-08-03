@@ -38,7 +38,8 @@ use near_primitives::views::{
     QueryResponseKind, ViewStateResult,
 };
 use near_store::{
-    get_access_key_raw, ColState, PartialStorage, ShardTries, Store, Trie, WrappedTrieChanges,
+    get_access_key_raw, ColState, PartialStorage, ShardTries, Store, Trie, TrieCaches,
+    WrappedTrieChanges,
 };
 use node_runtime::adapter::ViewRuntimeAdapter;
 use node_runtime::state_viewer::TrieViewer;
@@ -115,12 +116,192 @@ pub struct NightshadeRuntime {
     genesis_config: GenesisConfig,
 
     store: Arc<Store>,
-    tries: ShardTries,
-    trie_viewer: TrieViewer,
+    trie_caches: TrieCaches,
     pub runtime: Runtime,
     epoch_manager: SafeEpochManager,
     shard_tracker: ShardTracker,
     genesis_state_roots: Vec<StateRoot>,
+}
+
+pub struct NightshadeRuntimeState<'a> {
+    runtime: &'a NightshadeRuntime,
+    tries: ShardTries,
+    trie_viewer: TrieViewer,
+}
+
+impl<'a> NightshadeRuntimeState<'a> {
+    /// Processes state update.
+    fn process_state_update(
+        &self,
+        trie: Trie,
+        state_root: CryptoHash,
+        shard_id: ShardId,
+        block_height: BlockHeight,
+        block_hash: &CryptoHash,
+        block_timestamp: u64,
+        prev_block_hash: &CryptoHash,
+        receipts: &[Receipt],
+        transactions: &[SignedTransaction],
+        last_validator_proposals: &[ValidatorStake],
+        gas_price: Balance,
+        gas_limit: Gas,
+        challenges_result: &ChallengesResult,
+    ) -> Result<ApplyTransactionResult, Error> {
+        let validator_accounts_update = {
+            let mut epoch_manager =
+                self.runtime.epoch_manager.as_ref().write().expect(POISONED_LOCK_ERR);
+            debug!(target: "runtime",
+                   "block height: {}, is next_block_epoch_start {}",
+                   block_height,
+                   epoch_manager.is_next_block_epoch_start(prev_block_hash).unwrap()
+            );
+
+            let mut slashing_info: HashMap<_, _> = challenges_result
+                .iter()
+                .filter_map(|s| {
+                    if self.runtime.account_id_to_shard_id(&s.account_id) == shard_id
+                        && !s.is_double_sign
+                    {
+                        Some((s.account_id.clone(), None))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if epoch_manager.is_next_block_epoch_start(prev_block_hash)? {
+                let (stake_info, validator_reward, double_sign_slashing_info) =
+                    epoch_manager.compute_stake_return_info(prev_block_hash)?;
+                let stake_info = stake_info
+                    .into_iter()
+                    .filter(|(account_id, _)| {
+                        self.runtime.account_id_to_shard_id(account_id) == shard_id
+                    })
+                    .collect();
+                let validator_rewards = validator_reward
+                    .into_iter()
+                    .filter(|(account_id, _)| {
+                        self.runtime.account_id_to_shard_id(account_id) == shard_id
+                    })
+                    .collect();
+                let last_proposals = last_validator_proposals
+                    .iter()
+                    .filter(|v| self.runtime.account_id_to_shard_id(&v.account_id) == shard_id)
+                    .fold(HashMap::new(), |mut acc, v| {
+                        acc.insert(v.account_id.clone(), v.stake);
+                        acc
+                    });
+                let double_sign_slashing_info: HashMap<_, _> = double_sign_slashing_info
+                    .into_iter()
+                    .filter(|(account_id, _)| {
+                        self.runtime.account_id_to_shard_id(account_id) == shard_id
+                    })
+                    .map(|(account_id, stake)| (account_id, Some(stake)))
+                    .collect();
+                slashing_info.extend(double_sign_slashing_info);
+                Some(ValidatorAccountsUpdate {
+                    stake_info,
+                    validator_rewards,
+                    last_proposals,
+                    protocol_treasury_account_id: Some(
+                        self.runtime.genesis_config.protocol_treasury_account.clone(),
+                    )
+                    .filter(|account_id| {
+                        self.runtime.account_id_to_shard_id(account_id) == shard_id
+                    }),
+                    slashing_info,
+                })
+            } else if !challenges_result.is_empty() {
+                Some(ValidatorAccountsUpdate {
+                    stake_info: Default::default(),
+                    validator_rewards: Default::default(),
+                    last_proposals: Default::default(),
+                    protocol_treasury_account_id: None,
+                    slashing_info,
+                })
+            } else {
+                None
+            }
+        };
+
+        let epoch_height = self.runtime.get_epoch_height_from_prev_block(prev_block_hash)?;
+        let epoch_id = self.runtime.get_epoch_id_from_prev_block(prev_block_hash)?;
+
+        let apply_state = ApplyState {
+            block_index: block_height,
+            last_block_hash: *prev_block_hash,
+            epoch_id,
+            epoch_height,
+            gas_price,
+            block_timestamp,
+            gas_limit: Some(gas_limit),
+        };
+
+        let apply_result = self
+            .runtime
+            .runtime
+            .apply(
+                trie,
+                state_root,
+                &validator_accounts_update,
+                &apply_state,
+                &receipts,
+                &transactions,
+                &self.runtime.epoch_manager,
+            )
+            .map_err(|e| match e {
+                RuntimeError::InvalidTxError(_) => Error::from(ErrorKind::InvalidTransactions),
+                // TODO(#2152): process gracefully
+                RuntimeError::BalanceMismatchError(e) => panic!("{}", e),
+                // TODO(#2152): process gracefully
+                RuntimeError::UnexpectedIntegerOverflow => {
+                    panic!("RuntimeError::UnexpectedIntegerOverflow")
+                }
+                RuntimeError::StorageError(e) => Error::from(ErrorKind::StorageError(e)),
+                // TODO(#2152): process gracefully
+                RuntimeError::ReceiptValidationError(e) => panic!("{}", e),
+                RuntimeError::ValidatorError(e) => e.into(),
+            })?;
+
+        let total_gas_burnt =
+            apply_result.outcomes.iter().map(|tx_result| tx_result.outcome.gas_burnt).sum();
+        let total_balance_burnt = apply_result
+            .stats
+            .tx_burnt_amount
+            .checked_add(apply_result.stats.other_burnt_amount)
+            .and_then(|result| result.checked_add(apply_result.stats.slashed_burnt_amount))
+            .ok_or_else(|| {
+                ErrorKind::Other("Integer overflow during burnt balance summation".to_string())
+            })?;
+
+        // Sort the receipts into appropriate outgoing shards.
+        let mut receipt_result = HashMap::default();
+        for receipt in apply_result.outgoing_receipts {
+            receipt_result
+                .entry(self.runtime.account_id_to_shard_id(&receipt.receiver_id))
+                .or_insert_with(|| vec![])
+                .push(receipt);
+        }
+
+        let result = ApplyTransactionResult {
+            trie_changes: WrappedTrieChanges::new(
+                self.get_tries(),
+                shard_id,
+                apply_result.trie_changes,
+                apply_result.state_changes,
+                block_hash.clone(),
+            ),
+            new_root: apply_result.state_root,
+            outcomes: apply_result.outcomes,
+            receipt_result,
+            validator_proposals: apply_result.validator_proposals,
+            total_gas_burnt,
+            total_balance_burnt,
+            proof: apply_result.proof,
+        };
+
+        Ok(result)
+    }
 }
 
 impl NightshadeRuntime {
@@ -132,7 +313,6 @@ impl NightshadeRuntime {
         initial_tracking_shards: Vec<ShardId>,
     ) -> Self {
         let runtime = Runtime::new(genesis.config.runtime_config.clone());
-        let trie_viewer = TrieViewer::new();
         let genesis_config = genesis.config.clone();
         let num_shards = genesis.config.num_block_producer_seats_per_shard.len() as NumShards;
         let initial_epoch_config = EpochConfig {
@@ -165,7 +345,8 @@ impl NightshadeRuntime {
             online_max_threshold: genesis.config.online_max_threshold,
             online_min_threshold: genesis.config.online_min_threshold,
         };
-        let (store, tries, state_roots) = Self::initialize_genesis_state(store, home_dir, genesis);
+        let (store, trie_caches, state_roots) =
+            Self::initialize_genesis_state(store, home_dir, genesis);
         let epoch_manager = Arc::new(RwLock::new(
             EpochManager::new(
                 store.clone(),
@@ -198,9 +379,8 @@ impl NightshadeRuntime {
         NightshadeRuntime {
             genesis_config,
             store,
-            tries,
+            trie_caches,
             runtime,
-            trie_viewer,
             epoch_manager: SafeEpochManager(epoch_manager),
             shard_tracker,
             genesis_state_roots: state_roots,
@@ -233,7 +413,7 @@ impl NightshadeRuntime {
     fn genesis_state_from_records(
         store: Arc<Store>,
         genesis: Arc<Genesis>,
-    ) -> (Arc<Store>, ShardTries, Vec<StateRoot>) {
+    ) -> (Arc<Store>, TrieCaches, Vec<StateRoot>) {
         let mut store_update = store.store_update();
         let mut state_roots = vec![];
         let num_shards = genesis.config.num_block_producer_seats_per_shard.len() as NumShards;
@@ -249,7 +429,8 @@ impl NightshadeRuntime {
             }
         }
         assert!(has_protocol_account, "Genesis spec doesn't have protocol treasury account");
-        let tries = ShardTries::new(store.clone(), num_shards);
+        let trie_caches = TrieCaches::new(num_shards);
+        let tries = ShardTries::new(store.clone(), trie_caches.clone());
         let runtime = Runtime::new(genesis.config.runtime_config.clone());
         for shard_id in 0..num_shards {
             let validators = genesis
@@ -278,14 +459,14 @@ impl NightshadeRuntime {
             state_roots.push(state_root);
         }
         store_update.commit().expect("Store update failed on genesis intialization");
-        (store, tries, state_roots)
+        (store, trie_caches, state_roots)
     }
 
     fn initialize_genesis_state(
         store: Arc<Store>,
         home_dir: &Path,
         genesis: Arc<Genesis>,
-    ) -> (Arc<Store>, ShardTries, Vec<StateRoot>) {
+    ) -> (Arc<Store>, TrieCaches, Vec<StateRoot>) {
         let has_records = !genesis.records.as_ref().is_empty();
         let has_dump = {
             let mut state_dump = home_dir.to_path_buf();
@@ -297,177 +478,15 @@ impl NightshadeRuntime {
                 warn!(target: "runtime", "Found both records in genesis config and the state dump file. Will ignore the records.");
             }
             let (store, state_roots) = Self::genesis_state_from_dump(store, home_dir);
-            let tries = ShardTries::new(
-                store.clone(),
+            let trie_caches = TrieCaches::new(
                 genesis.config.num_block_producer_seats_per_shard.len() as NumShards,
             );
-            (store, tries, state_roots)
+            (store, trie_caches, state_roots)
         } else if has_records {
             Self::genesis_state_from_records(store, genesis)
         } else {
             panic!("Found neither records in the config nor the state dump file. Either one should be present")
         }
-    }
-
-    /// Processes state update.
-    fn process_state_update(
-        &self,
-        trie: Trie,
-        state_root: CryptoHash,
-        shard_id: ShardId,
-        block_height: BlockHeight,
-        block_hash: &CryptoHash,
-        block_timestamp: u64,
-        prev_block_hash: &CryptoHash,
-        receipts: &[Receipt],
-        transactions: &[SignedTransaction],
-        last_validator_proposals: &[ValidatorStake],
-        gas_price: Balance,
-        gas_limit: Gas,
-        challenges_result: &ChallengesResult,
-    ) -> Result<ApplyTransactionResult, Error> {
-        let validator_accounts_update = {
-            let mut epoch_manager = self.epoch_manager.as_ref().write().expect(POISONED_LOCK_ERR);
-            debug!(target: "runtime",
-                   "block height: {}, is next_block_epoch_start {}",
-                   block_height,
-                   epoch_manager.is_next_block_epoch_start(prev_block_hash).unwrap()
-            );
-
-            let mut slashing_info: HashMap<_, _> = challenges_result
-                .iter()
-                .filter_map(|s| {
-                    if self.account_id_to_shard_id(&s.account_id) == shard_id && !s.is_double_sign {
-                        Some((s.account_id.clone(), None))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if epoch_manager.is_next_block_epoch_start(prev_block_hash)? {
-                let (stake_info, validator_reward, double_sign_slashing_info) =
-                    epoch_manager.compute_stake_return_info(prev_block_hash)?;
-                let stake_info = stake_info
-                    .into_iter()
-                    .filter(|(account_id, _)| self.account_id_to_shard_id(account_id) == shard_id)
-                    .collect();
-                let validator_rewards = validator_reward
-                    .into_iter()
-                    .filter(|(account_id, _)| self.account_id_to_shard_id(account_id) == shard_id)
-                    .collect();
-                let last_proposals = last_validator_proposals
-                    .iter()
-                    .filter(|v| self.account_id_to_shard_id(&v.account_id) == shard_id)
-                    .fold(HashMap::new(), |mut acc, v| {
-                        acc.insert(v.account_id.clone(), v.stake);
-                        acc
-                    });
-                let double_sign_slashing_info: HashMap<_, _> = double_sign_slashing_info
-                    .into_iter()
-                    .filter(|(account_id, _)| self.account_id_to_shard_id(account_id) == shard_id)
-                    .map(|(account_id, stake)| (account_id, Some(stake)))
-                    .collect();
-                slashing_info.extend(double_sign_slashing_info);
-                Some(ValidatorAccountsUpdate {
-                    stake_info,
-                    validator_rewards,
-                    last_proposals,
-                    protocol_treasury_account_id: Some(
-                        self.genesis_config.protocol_treasury_account.clone(),
-                    )
-                    .filter(|account_id| self.account_id_to_shard_id(account_id) == shard_id),
-                    slashing_info,
-                })
-            } else if !challenges_result.is_empty() {
-                Some(ValidatorAccountsUpdate {
-                    stake_info: Default::default(),
-                    validator_rewards: Default::default(),
-                    last_proposals: Default::default(),
-                    protocol_treasury_account_id: None,
-                    slashing_info,
-                })
-            } else {
-                None
-            }
-        };
-
-        let epoch_height = self.get_epoch_height_from_prev_block(prev_block_hash)?;
-        let epoch_id = self.get_epoch_id_from_prev_block(prev_block_hash)?;
-
-        let apply_state = ApplyState {
-            block_index: block_height,
-            last_block_hash: *prev_block_hash,
-            epoch_id,
-            epoch_height,
-            gas_price,
-            block_timestamp,
-            gas_limit: Some(gas_limit),
-        };
-
-        let apply_result = self
-            .runtime
-            .apply(
-                trie,
-                state_root,
-                &validator_accounts_update,
-                &apply_state,
-                &receipts,
-                &transactions,
-                &self.epoch_manager,
-            )
-            .map_err(|e| match e {
-                RuntimeError::InvalidTxError(_) => Error::from(ErrorKind::InvalidTransactions),
-                // TODO(#2152): process gracefully
-                RuntimeError::BalanceMismatchError(e) => panic!("{}", e),
-                // TODO(#2152): process gracefully
-                RuntimeError::UnexpectedIntegerOverflow => {
-                    panic!("RuntimeError::UnexpectedIntegerOverflow")
-                }
-                RuntimeError::StorageError(e) => Error::from(ErrorKind::StorageError(e)),
-                // TODO(#2152): process gracefully
-                RuntimeError::ReceiptValidationError(e) => panic!("{}", e),
-                RuntimeError::ValidatorError(e) => e.into(),
-            })?;
-
-        let total_gas_burnt =
-            apply_result.outcomes.iter().map(|tx_result| tx_result.outcome.gas_burnt).sum();
-        let total_balance_burnt = apply_result
-            .stats
-            .tx_burnt_amount
-            .checked_add(apply_result.stats.other_burnt_amount)
-            .and_then(|result| result.checked_add(apply_result.stats.slashed_burnt_amount))
-            .ok_or_else(|| {
-                ErrorKind::Other("Integer overflow during burnt balance summation".to_string())
-            })?;
-
-        // Sort the receipts into appropriate outgoing shards.
-        let mut receipt_result = HashMap::default();
-        for receipt in apply_result.outgoing_receipts {
-            receipt_result
-                .entry(self.account_id_to_shard_id(&receipt.receiver_id))
-                .or_insert_with(|| vec![])
-                .push(receipt);
-        }
-
-        let result = ApplyTransactionResult {
-            trie_changes: WrappedTrieChanges::new(
-                self.get_tries(),
-                shard_id,
-                apply_result.trie_changes,
-                apply_result.state_changes,
-                block_hash.clone(),
-            ),
-            new_root: apply_result.state_root,
-            outcomes: apply_result.outcomes,
-            receipt_result,
-            validator_proposals: apply_result.validator_proposals,
-            total_gas_burnt,
-            total_balance_burnt,
-            proof: apply_result.proof,
-        };
-
-        Ok(result)
     }
 }
 
@@ -484,34 +503,13 @@ pub fn state_record_to_shard_id(state_record: &StateRecord, num_shards: NumShard
     }
 }
 
-impl RuntimeStateAdapter for NightshadeRuntime {
+impl<'a> RuntimeStateAdapter for NightshadeRuntimeState<'a> {
     fn get_tries(&self) -> ShardTries {
         self.tries.clone()
     }
 
     fn get_trie_for_shard(&self, shard_id: ShardId) -> Trie {
         self.tries.get_trie_for_shard(shard_id)
-    }
-
-    fn verify_block_vrf(
-        &self,
-        epoch_id: &EpochId,
-        block_height: BlockHeight,
-        prev_random_value: &CryptoHash,
-        vrf_value: &near_crypto::vrf::Value,
-        vrf_proof: &near_crypto::vrf::Proof,
-    ) -> Result<(), Error> {
-        let mut epoch_manager = self.epoch_manager.as_ref().write().expect(POISONED_LOCK_ERR);
-        let validator = epoch_manager.get_block_producer_info(&epoch_id, block_height)?;
-        let public_key = near_crypto::key_conversion::convert_public_key(
-            validator.public_key.unwrap_as_ed25519(),
-        )
-        .unwrap();
-
-        if !public_key.is_vrf_valid(&prev_random_value.as_ref(), vrf_value, vrf_proof) {
-            return Err(ErrorKind::InvalidRandomnessBeaconOutput.into());
-        }
-        Ok(())
     }
 
     fn validate_tx(
@@ -521,11 +519,11 @@ impl RuntimeStateAdapter for NightshadeRuntime {
         transaction: &SignedTransaction,
     ) -> Result<Option<InvalidTxError>, Error> {
         if let Some(state_root) = state_root {
-            let shard_id = self.account_id_to_shard_id(&transaction.transaction.signer_id);
+            let shard_id = self.runtime.account_id_to_shard_id(&transaction.transaction.signer_id);
             let mut state_update = self.get_tries().new_trie_update(shard_id, state_root);
 
             match verify_and_charge_transaction(
-                &self.runtime.config,
+                &self.runtime.runtime.config,
                 &mut state_update,
                 gas_price,
                 &transaction,
@@ -542,7 +540,7 @@ impl RuntimeStateAdapter for NightshadeRuntime {
             }
         } else {
             // Doing basic validation without a state root
-            match validate_transaction(&self.runtime.config, gas_price, &transaction) {
+            match validate_transaction(&self.runtime.runtime.config, gas_price, &transaction) {
                 Ok(_) => Ok(None),
                 Err(RuntimeError::InvalidTxError(err)) => {
                     debug!(target: "runtime", "Tx {:?} validation failed: {:?}", transaction, err);
@@ -582,7 +580,7 @@ impl RuntimeStateAdapter for NightshadeRuntime {
                     if chain_validate(&tx) {
                         // Verifying the validity of the transaction based on the current state.
                         match verify_and_charge_transaction(
-                            &self.runtime.config,
+                            &self.runtime.runtime.config,
                             &mut state_update,
                             gas_price,
                             &tx,
@@ -712,7 +710,7 @@ impl RuntimeStateAdapter for NightshadeRuntime {
                 let mut logs = vec![];
                 let epoch_height = {
                     let mut epoch_manager =
-                        self.epoch_manager.as_ref().write().expect(POISONED_LOCK_ERR);
+                        self.runtime.epoch_manager.as_ref().write().expect(POISONED_LOCK_ERR);
                     epoch_manager.get_epoch_info(&epoch_id)?.epoch_height
                 };
                 match self.call_function(
@@ -727,7 +725,7 @@ impl RuntimeStateAdapter for NightshadeRuntime {
                     method_name,
                     args.as_ref(),
                     &mut logs,
-                    &self.epoch_manager,
+                    &self.runtime.epoch_manager,
                 ) {
                     Ok(result) => Ok(QueryResponse {
                         kind: QueryResponseKind::CallResult(CallResult { result, logs }),
@@ -841,8 +839,12 @@ impl RuntimeStateAdapter for NightshadeRuntime {
 }
 
 impl RuntimeAdapter for NightshadeRuntime {
-    fn get_state_adapter(&self) -> &dyn RuntimeStateAdapter {
-        self
+    fn get_state_adapter<'a>(&'a self) -> Box<dyn RuntimeStateAdapter + 'a> {
+        Box::new(NightshadeRuntimeState {
+            runtime: self,
+            tries: ShardTries::new(self.store.clone(), self.trie_caches.clone()),
+            trie_viewer: TrieViewer::new(),
+        })
     }
 
     fn genesis_state(&self) -> (Arc<Store>, Vec<StateRoot>) {
@@ -888,7 +890,8 @@ impl RuntimeAdapter for NightshadeRuntime {
     ) -> Result<Option<InvalidTxError>, Error> {
         if let Some(state_root) = state_root {
             let shard_id = self.account_id_to_shard_id(&transaction.transaction.signer_id);
-            let mut state_update = self.get_tries().new_trie_update(shard_id, state_root);
+            let mut state_update =
+                self.get_state_adapter().get_tries().new_trie_update(shard_id, state_root);
 
             match verify_and_charge_transaction(
                 &self.runtime.config,
@@ -1286,7 +1289,7 @@ impl RuntimeAdapter for NightshadeRuntime {
         }
         let trie_changes = Trie::combine_state_parts(&state_root, &parts)
             .expect("combine_state_parts is guaranteed to succeed when each part is valid");
-        let tries = self.get_tries();
+        let tries = self.get_state_adapter().get_tries();
         let (store_update, _) =
             tries.apply_all(&trie_changes, shard_id).expect("TrieChanges::into never fails");
         Ok(store_update.commit()?)
@@ -1327,7 +1330,7 @@ impl RuntimeAdapter for NightshadeRuntime {
     }
 }
 
-impl node_runtime::adapter::ViewRuntimeAdapter for NightshadeRuntime {
+impl<'a> node_runtime::adapter::ViewRuntimeAdapter for NightshadeRuntimeState<'a> {
     fn view_account(
         &self,
         shard_id: ShardId,
@@ -1463,6 +1466,16 @@ mod test {
     }
 
     impl NightshadeRuntime {
+        fn get_state_adapter_nightshade(&self) -> Box<NightshadeRuntimeState> {
+            Box::new(NightshadeRuntimeState {
+                runtime: self,
+                tries: ShardTries::new(self.store.clone(), self.trie_caches.clone()),
+                trie_viewer: TrieViewer::new(),
+            })
+        }
+    }
+
+    impl<'a> NightshadeRuntimeState<'a> {
         fn update(
             &self,
             state_root: &StateRoot,
@@ -1494,7 +1507,7 @@ mod test {
                     challenges,
                 )
                 .unwrap();
-            let mut store_update = self.store.store_update();
+            let mut store_update = self.runtime.store.store_update();
             result.trie_changes.insertions_into(&mut store_update).unwrap();
             result.trie_changes.state_changes_into(&mut store_update);
             store_update.commit().unwrap();
@@ -1594,20 +1607,21 @@ mod test {
             let mut all_proposals = vec![];
             let mut new_receipts = HashMap::new();
             for i in 0..num_shards {
-                let (state_root, proposals, receipts) = self.runtime.update(
-                    &self.state_roots[i as usize],
-                    i,
-                    self.head.height + 1,
-                    0,
-                    &self.head.last_block_hash,
-                    &new_hash,
-                    self.last_receipts.get(&i).unwrap_or(&vec![]),
-                    &transactions[i as usize],
-                    self.last_shard_proposals.get(&i).unwrap_or(&vec![]),
-                    self.runtime.genesis_config.min_gas_price,
-                    u64::max_value(),
-                    &challenges_result,
-                );
+                let (state_root, proposals, receipts) =
+                    self.runtime.get_state_adapter_nightshade().update(
+                        &self.state_roots[i as usize],
+                        i,
+                        self.head.height + 1,
+                        0,
+                        &self.head.last_block_hash,
+                        &new_hash,
+                        self.last_receipts.get(&i).unwrap_or(&vec![]),
+                        &transactions[i as usize],
+                        self.last_shard_proposals.get(&i).unwrap_or(&vec![]),
+                        self.runtime.genesis_config.min_gas_price,
+                        u64::max_value(),
+                        &challenges_result,
+                    );
                 self.state_roots[i as usize] = state_root;
                 for (shard_id, mut shard_receipts) in receipts {
                     new_receipts
@@ -1652,6 +1666,7 @@ mod test {
         pub fn view_account(&self, account_id: &str) -> AccountView {
             let shard_id = self.runtime.account_id_to_shard_id(&account_id.to_string());
             self.runtime
+                .get_state_adapter_nightshade()
                 .view_account(
                     shard_id,
                     self.state_roots[shard_id as usize],
@@ -2016,8 +2031,13 @@ mod test {
         let staking_transaction = stake(1, &signer, &block_producers[0], TESTING_INIT_STAKE + 1);
         env.step_default(vec![staking_transaction]);
         env.step_default(vec![]);
-        let state_part = env.runtime.obtain_state_part(0, &env.state_roots[0], 0, 1).unwrap();
-        let root_node = env.runtime.get_state_root_node(0, &env.state_roots[0]).unwrap();
+        let state_part = env
+            .runtime
+            .get_state_adapter()
+            .obtain_state_part(0, &env.state_roots[0], 0, 1)
+            .unwrap();
+        let root_node =
+            env.runtime.get_state_adapter().get_state_root_node(0, &env.state_roots[0]).unwrap();
         let mut new_env =
             TestEnv::new("test_state_sync", vec![validators.clone()], 2, vec![], vec![], true);
         for i in 1..=2 {

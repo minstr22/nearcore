@@ -13,16 +13,24 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 #[derive(Clone)]
+pub struct TrieCaches(pub(crate) Arc<Vec<TrieCache>>);
+
+impl TrieCaches {
+    pub fn new(num_shards: NumShards) -> Self {
+        assert_ne!(num_shards, 0);
+        Self(Arc::new((0..num_shards).map(|_| TrieCache::new()).collect::<Vec<_>>()))
+    }
+}
+
+#[derive(Clone)]
 pub struct ShardTries {
     pub(crate) store: Arc<dyn ReadSnapshot>,
-    pub(crate) caches: Arc<Vec<TrieCache>>,
+    pub(crate) caches: TrieCaches,
 }
 
 impl ShardTries {
-    pub fn new(store: Arc<Store>, num_shards: NumShards) -> Self {
-        assert_ne!(num_shards, 0);
+    pub fn new(store: Arc<Store>, caches: TrieCaches) -> Self {
         let store = store.storage.clone().get_snapshot();
-        let caches = Arc::new((0..num_shards).map(|_| TrieCache::new()).collect::<Vec<_>>());
         ShardTries { store, caches }
     }
 
@@ -33,7 +41,7 @@ impl ShardTries {
     pub fn get_trie_for_shard(&self, shard_id: ShardId) -> Trie {
         let store = Box::new(TrieCachingStorage::new(
             self.store.clone(),
-            self.caches[shard_id as usize].clone(),
+            self.caches.0[shard_id as usize].clone(),
             shard_id,
         ));
         Trie::new(store, shard_id)
@@ -44,7 +52,7 @@ impl ShardTries {
     }
 
     pub fn update_cache(&self, transaction: &DBTransaction) -> std::io::Result<()> {
-        let mut shards = vec![Vec::new(); self.caches.len()];
+        let mut shards = vec![Vec::new(); self.caches.0.len()];
         for op in &transaction.ops {
             match op {
                 DBOp::Insert { col, ref key, ref value } if *col == DBCol::ColState => {
@@ -59,7 +67,7 @@ impl ShardTries {
             }
         }
         for (shard_id, ops) in shards.into_iter().enumerate() {
-            self.caches[shard_id].update_cache(ops);
+            self.caches.0[shard_id].update_cache(ops);
         }
         Ok(())
     }

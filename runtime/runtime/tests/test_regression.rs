@@ -19,7 +19,9 @@ use near_primitives::transaction::{
 };
 use near_primitives::types::StateChangeCause;
 use near_store::test_utils::create_tries;
-use near_store::{create_store, get_account, set_access_key, set_account, set_code, ShardTries};
+use near_store::{
+    create_store, get_account, set_access_key, set_account, set_code, ShardTries, TrieCaches,
+};
 use near_vm_logic::types::Balance;
 
 pub mod runtime_group_tools;
@@ -64,7 +66,7 @@ fn template_test(transaction_type: TransactionType, db_type: DataBaseType, expec
     let tries = match db_type {
         DataBaseType::Disk => {
             let store = create_store(tmpdir.path().to_str().unwrap());
-            ShardTries::new(store, 1)
+            ShardTries::new(store, TrieCaches::new(1))
         }
         DataBaseType::InMemory => create_tries(),
     };

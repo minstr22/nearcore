@@ -16,6 +16,7 @@ use near_primitives::{
 use near_runtime_configs::RuntimeConfig;
 use near_store::{
     get_access_key, get_account, set_account, test_utils::create_test_store, ShardTries, Store,
+    TrieCaches,
 };
 use node_runtime::{state_viewer::TrieViewer, ApplyState, Runtime};
 use std::collections::HashMap;
@@ -129,7 +130,7 @@ impl RuntimeStandalone {
         let mut genesis_block = Block::genesis(&genesis);
         let mut store_update = store.store_update();
         let runtime = Runtime::new(genesis.runtime_config.clone());
-        let tries = ShardTries::new(store, 1);
+        let tries = ShardTries::new(store, TrieCaches::new(1));
         let (s_update, state_root) =
             runtime.apply_genesis_state(tries.clone(), 0, &[], &genesis.state_records);
         store_update.merge(s_update);

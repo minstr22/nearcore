@@ -219,15 +219,6 @@ pub trait RuntimeStateAdapter: Send + Sync {
     /// Returns trie.
     fn get_trie_for_shard(&self, shard_id: ShardId) -> Trie;
 
-    fn verify_block_vrf(
-        &self,
-        epoch_id: &EpochId,
-        block_height: BlockHeight,
-        prev_random_value: &CryptoHash,
-        vrf_value: &near_crypto::vrf::Value,
-        vrf_proof: &near_crypto::vrf::Proof,
-    ) -> Result<(), Error>;
-
     /// Validates a given signed transaction.
     /// If the state root is given, then the verification will use the account. Otherwise it will
     /// only validate the transaction math, limits and signatures.
@@ -362,7 +353,8 @@ pub trait RuntimeStateAdapter: Send + Sync {
 /// Main function is to update state given transactions.
 /// Additionally handles validators.
 pub trait RuntimeAdapter: Send + Sync {
-    fn get_state_adapter(&self) -> &dyn RuntimeStateAdapter;
+    /// RuntimeStateAdapter should be created for the lifetime of a block/query processing
+    fn get_state_adapter<'a>(&'a self) -> Box<dyn RuntimeStateAdapter + 'a>;
 
     /// Get store and genesis state roots
     fn genesis_state(&self) -> (Arc<Store>, Vec<StateRoot>);

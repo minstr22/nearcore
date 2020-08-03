@@ -29,8 +29,8 @@ use near_primitives::types::AccountId;
 use crate::db::{DBOp, DBTransaction, Database, RocksDB};
 pub use crate::trie::{
     iterator::TrieIterator, update::TrieUpdate, update::TrieUpdateIterator,
-    update::TrieUpdateValuePtr, KeyForStateChanges, PartialStorage, ShardTries, Trie, TrieChanges,
-    WrappedTrieChanges,
+    update::TrieUpdateValuePtr, KeyForStateChanges, PartialStorage, ShardTries, Trie, TrieCaches,
+    TrieChanges, WrappedTrieChanges,
 };
 use std::ops::Deref;
 use std::pin::Pin;
@@ -181,8 +181,8 @@ impl StoreUpdate {
                 self.tries = Some(tries);
             } else {
                 debug_assert_eq!(
-                    self.tries.as_ref().unwrap().caches.as_ref() as *const _,
-                    tries.caches.as_ref() as *const _
+                    self.tries.as_ref().unwrap().caches.0.as_ref() as *const _,
+                    tries.caches.0.as_ref() as *const _
                 );
             }
         }
@@ -217,9 +217,10 @@ impl StoreUpdate {
             self
         );
         if let Some(tries) = self.tries {
+            // as *const () cast because of https://github.com/rust-lang/rust/issues/46139
             assert_eq!(
-                tries.get_store().storage.deref() as *const _,
-                self.storage.deref() as *const _
+                tries.get_store().storage.deref() as *const _ as *const (),
+                self.storage.deref() as *const _ as *const ()
             );
             tries.update_cache(&self.transaction)?;
         }
